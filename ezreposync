@@ -1,0 +1,177 @@
+#!/bin/sh
+
+scriptname="${0##*/}"
+version="1.7.1"
+
+version() {
+    printf "%s %s\n" "$scriptname" "$version"
+}
+
+usage() {
+    cat <<EOF
+Usage: $scriptname [OPTIONS] [repoid] ...
+Sync yum repo(s) with group and security metadata. Defaults to all enabled.
+Compatable with EL6/7. Requires yum-utils and createrepo. Must be run as root.
+
+Options:
+    -d <directory>   Directory to download repositories to: defaults to current
+                     directory
+    -g               Generate local.repo template in download directory
+    -h               Print usage and exit
+    -l <file>        File to write log to: defaults to none
+    -v               Enable verbose logs and output
+    -V               Print version and exit
+EOF
+}
+
+# trap SIGINT (^C), SIGTERM (kill), and bash EXIT
+trap "exit 1" INT TERM EXIT
+
+# set vars for non-POSIX command paths
+cmd_reposync=/usr/bin/reposync
+cmd_createrepo=/usr/bin/createrepo
+cmd_yum=/usr/bin/yum
+cmd_modifyrepo=/usr/bin/modifyrepo
+
+# set default variables
+dpath="$PWD"
+logfile=/dev/null
+verbose="false"
+repos=""
+gendotrepo="false"
+
+# logging function, takes stdin and writes each line to stdout, and $logfile
+# with a timestamp
+log() {
+    while read -r line; do
+        printf "%s " "$(date "+%b %d %H:%M:%S")" >>"$logfile"
+        printf "%s\n" "$line" | tee -a "$logfile"
+    done
+}
+
+# verbose function, takes stdin and writes to stdout when $verbose = true
+verbose() {
+    if [ "$verbose" = "true" ]; then
+        while read -r line; do
+            printf "%s\n" "$line"
+        done
+    else
+        tee >/dev/null 2>&1
+    fi
+}
+
+# parse args
+while getopts ":d:ghl:vV" opt; do
+    case "$opt" in
+    d)
+        dpath="$OPTARG"
+        ;;
+    g)
+        gendotrepo="true"
+        ;;
+    h)
+        usage
+        exit 0
+        ;;
+    l)
+        logfile="$OPTARG"
+        ;;
+    v)
+        verbose="true"
+        ;;
+    V)
+        version
+        exit 0
+        ;;
+    \?)
+        printf "%s ERROR: invalid option %s\n" "$scriptname" "-$OPTARG" >&2
+        usage
+        exit 1
+        ;;
+    :)
+        printf "%s ERROR: option %s requires an argument\n" "$scriptname" "-$OPTARG" >&2
+        usage
+        exit 1
+        ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# verify the log file is writable, we must do this first after parsing args
+# since the following checks can write to the log
+if ! touch "$logfile" >/dev/null 2>&1; then
+    printf "%s ERROR: invalid log file %s\n" "$scriptname" "$logfile" >&2
+    exit 1
+fi
+
+# print and log that we have started
+printf "%s started\n" "$scriptname" | log
+
+# check if we got a list of repos as args, if not set $repos to all enabled
+if [ "$*" ]; then
+    repos="$*"
+else
+    repos=$($cmd_yum -y repolist | awk -F '[ /]' '/repolist: / {show=0} show {sub(/^[!*]/, "", $1); printf $1" "} /status/ {show=1}')
+fi
+
+# verify the repos actually exist
+for repo in $repos; do
+    if ! $cmd_yum -y repolist all "$repo" | grep -q "$repo"; then
+        printf "%s ERROR: repository %s not found\n" "$scriptname" "$repo" | log >&2
+        usage
+        exit 1
+    fi
+done
+
+# verify we are running as root
+if [ ! "$(id -u)" = "0" ]; then
+    printf "%s ERROR: You are not root\n" "$scriptname" | log >&2
+    exit 1
+fi
+
+# verify the download directory is a directory
+if [ ! -d "$dpath" ]; then
+    printf "%s ERROR: invalid download directory %s\n" "$scriptname" "$dpath" | log >&2
+    exit 1
+fi
+
+# generate a local.repo file in the download dir if -g was used
+if [ "$gendotrepo" = "true" ]; then
+    repofile="$dpath/local.repo"
+    printf "" > "$repofile"
+    for repo in $repos; do 
+        printf "[%s]\n" "$repo" >> "$repofile"
+        reponame=$($cmd_yum -y -v repolist "$repo" | grep 'Repo-name' | awk -F : '{ sub("^ ", "", $2); print $2 }')
+        printf "name=%s\nbaseurl=REPLACEME\n\n" "$reponame" >> "$repofile"
+    done
+fi
+
+# main program
+for repo in $repos; do
+    printf "Syncing repo: %s\nDownloading repo packages\n" "$repo"
+    $cmd_reposync --download-metadata -q -l -m -p "$dpath" -r "$repo" | verbose
+
+    if [ -s "$dpath/$repo/comps.xml" ]; then
+        printf "Group metadata: found\nCreating repo with groups\n"
+        $cmd_createrepo -g comps.xml --update "$dpath/$repo" | verbose
+    else
+        printf "Group metadata: not found\nCreating repo\n"
+        $cmd_createrepo --update "$dpath/$repo" | verbose
+    fi
+
+    printf "Searching for security metadata\n"
+    $cmd_yum -y --enablerepo='*' clean all >/dev/null 2>&1
+    $cmd_yum -y --disablerepo='*' --enablerepo="$repo" list-sec | verbose
+    updateinfo=$(find /var/cache/yum/ -name updateinfo.xml | grep "/$repo/")
+
+    if [ -f "$updateinfo" ]; then
+        printf "Security metadata: found\nModifying repodata to include security metadata\n" 
+        $cmd_modifyrepo "$updateinfo" "$dpath/$repo/repodata" | verbose
+    else
+        printf "Security metadata: not found\n"
+    fi
+done 2>&1 | log
+
+# print and log that we have finished
+printf "%s finished\n" "$scriptname" | log
+exit 0
